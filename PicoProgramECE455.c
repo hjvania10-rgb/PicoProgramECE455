@@ -120,16 +120,34 @@
 
 // This is only the NOMINAL sample rate.
 //
-// We no longer use this number to calculate frequency.
-//
-// The actual sample timing is measured with the Pico clock.
+// Frequency still uses the sample rate measured over the
+// actual capture interval with the Pico clock.
 #define ADS_NOMINAL_SAMPLE_RATE  15000.0
 
 
-// Capture 3000 consecutive samples.
+// Stop the capture when EITHER:
 //
-// At about 15 kSPS this is approximately 0.2 seconds.
-#define NUM_SAMPLES 15000
+// 1. Four seconds have elapsed, OR
+// 2. The measured AC signal amplitude has fallen to 10%
+//    of the amplitude measured during the first window.
+//
+// The amplitude check uses 100 ms windows.  For a sinusoid,
+// AC RMS falls by the same ratio as peak amplitude, but RMS
+// is less sensitive to single-sample noise spikes.
+#define MAX_CAPTURE_US           4000000ULL
+#define AMPLITUDE_WINDOW_US      100000ULL
+#define DECAY_STOP_FRACTION      0.10
+
+
+// At 15 kSPS, 60,000 samples is approximately four seconds.
+//
+// IMPORTANT:
+// We intentionally store only the ADC codes, not one 64-bit
+// timestamp per sample.  60,000 int32_t samples use about
+// 240 kB, which is already close to the RP2040 SRAM limit.
+//
+// Timing is measured with the first and last DRDY timestamps.
+#define MAX_SAMPLES              60000
 
 
 // ============================================================
@@ -137,10 +155,15 @@
 // ============================================================
 
 // ADC conversion codes
-static int32_t sample_buffer[NUM_SAMPLES];
+static int32_t sample_buffer[MAX_SAMPLES];
 
-// Timestamp of each DRDY event in microseconds
-static uint64_t time_buffer[NUM_SAMPLES];
+
+typedef enum
+{
+    CAPTURE_STOP_TIME_LIMIT,
+    CAPTURE_STOP_DECAY_LIMIT,
+    CAPTURE_STOP_BUFFER_LIMIT
+} capture_stop_reason_t;
 
 
 // ============================================================
@@ -580,48 +603,105 @@ static double ads_code_to_voltage(
 // ============================================================
 // Capture consecutive samples
 //
-// We:
+// Capture stops when EITHER:
 //
-// 1. Wait for DRDY
-// 2. Timestamp DRDY immediately
-// 3. Read the ADC result
+// 1. Four seconds have elapsed, OR
+// 2. The AC RMS signal has fallen to 10% of the RMS measured
+//    during the first 100 ms amplitude window.
 //
-// There is NO printf() and NO long delay inside
-// this loop.
+// We compare AC POWER instead of taking square roots:
+//
+//      RMS <= 0.10 * initial RMS
+//
+// is equivalent to:
+//
+//      variance <= 0.01 * initial variance
+//
+// There is NO printf() and NO long delay inside this loop.
 // ============================================================
 
 static bool ads_capture_samples(
     int32_t *samples,
-    uint64_t *timestamps,
-    uint32_t number_of_samples
+    uint32_t max_samples,
+    uint32_t *samples_captured,
+    uint64_t *first_sample_time_us,
+    uint64_t *last_sample_time_us,
+    capture_stop_reason_t *stop_reason
 )
 {
+    *samples_captured =
+        0;
+
+    *first_sample_time_us =
+        0;
+
+    *last_sample_time_us =
+        0;
+
+
+    bool initial_amplitude_ready =
+        false;
+
+    double initial_ac_power =
+        0.0;
+
+
+    // Running statistics for the current 100 ms window.
+    //
+    // AC power = variance = E[x^2] - E[x]^2
+    double window_sum =
+        0.0;
+
+    double window_sum_squares =
+        0.0;
+
+    uint32_t window_samples =
+        0;
+
+
+    uint64_t capture_start_us =
+        0;
+
+    uint64_t window_start_us =
+        0;
+
+
     for (
         uint32_t i = 0;
-        i < number_of_samples;
+        i < max_samples;
         i++
     )
     {
-        // Wait for the next ADC conversion
+        // Wait for the next ADC conversion.
         if (!ads_wait_drdy(100))
         {
             return false;
         }
 
 
-        // Timestamp as soon as DRDY is detected LOW.
-        //
-        // This represents when this ADC conversion
-        // became available.
-        timestamps[i] =
+        // Timestamp immediately when DRDY is observed LOW.
+        uint64_t sample_time_us =
             time_us_64();
+
+
+        if (i == 0)
+        {
+            capture_start_us =
+                sample_time_us;
+
+            window_start_us =
+                sample_time_us;
+
+            *first_sample_time_us =
+                sample_time_us;
+        }
 
 
         int32_t code;
         uint32_t raw;
 
 
-        // Read the conversion associated with this DRDY
+        // Read the conversion associated with this DRDY.
         ads_read_data_ready(
             &code,
             &raw
@@ -630,8 +710,129 @@ static bool ads_capture_samples(
 
         samples[i] =
             code;
+
+        *samples_captured =
+            i + 1;
+
+        *last_sample_time_us =
+            sample_time_us;
+
+
+        // ----------------------------------------------------
+        // Add this sample to the current amplitude window.
+        // ----------------------------------------------------
+
+        double value =
+            (double)code;
+
+        window_sum +=
+            value;
+
+        window_sum_squares +=
+            value * value;
+
+        window_samples++;
+
+
+        // ----------------------------------------------------
+        // Every 100 ms, estimate the AC signal amplitude.
+        // ----------------------------------------------------
+
+        if (
+            (sample_time_us - window_start_us) >=
+            AMPLITUDE_WINDOW_US
+        )
+        {
+            double count =
+                (double)window_samples;
+
+            double mean =
+                window_sum /
+                count;
+
+            double mean_square =
+                window_sum_squares /
+                count;
+
+            double ac_power =
+                mean_square -
+                (mean * mean);
+
+
+            // Numerical roundoff can produce a tiny
+            // negative value very close to zero.
+            if (ac_power < 0.0)
+            {
+                ac_power =
+                    0.0;
+            }
+
+
+            if (!initial_amplitude_ready)
+            {
+                // The first complete 100 ms window defines
+                // "100% original signal."
+                initial_ac_power =
+                    ac_power;
+
+                initial_amplitude_ready =
+                    true;
+            }
+            else if (initial_ac_power > 0.0)
+            {
+                // 10% RMS amplitude = 1% AC power.
+                double stop_power =
+                    initial_ac_power *
+                    DECAY_STOP_FRACTION *
+                    DECAY_STOP_FRACTION;
+
+
+                if (ac_power <= stop_power)
+                {
+                    *stop_reason =
+                        CAPTURE_STOP_DECAY_LIMIT;
+
+                    return true;
+                }
+            }
+
+
+            // Start a new 100 ms amplitude window.
+            window_start_us =
+                sample_time_us;
+
+            window_sum =
+                0.0;
+
+            window_sum_squares =
+                0.0;
+
+            window_samples =
+                0;
+        }
+
+
+        // ----------------------------------------------------
+        // Hard four-second capture limit.
+        // ----------------------------------------------------
+
+        if (
+            (sample_time_us - capture_start_us) >=
+            MAX_CAPTURE_US
+        )
+        {
+            *stop_reason =
+                CAPTURE_STOP_TIME_LIMIT;
+
+            return true;
+        }
     }
 
+
+    // At nominal 15 kSPS the 60,000-sample buffer reaches
+    // essentially the same point as the four-second limit.
+    *stop_reason =
+        CAPTURE_STOP_BUFFER_LIMIT;
 
     return true;
 }
@@ -695,13 +896,16 @@ static double calculate_vpp(
 // ============================================================
 // Calculate actual average sample rate
 //
-// This tells us how quickly samples REALLY arrived.
+// The ADS1256 conversion timing is uniform, so we only need
+// the timestamp of the first and last DRDY events.
 //
-// It does not assume 15,000 SPS.
+// This avoids storing a 64-bit timestamp for every sample,
+// which would not fit in Pico RAM for a four-second capture.
 // ============================================================
 
 static double calculate_measured_sample_rate(
-    const uint64_t *timestamps,
+    uint64_t first_sample_time_us,
+    uint64_t last_sample_time_us,
     uint32_t number_of_samples
 )
 {
@@ -712,8 +916,8 @@ static double calculate_measured_sample_rate(
 
 
     uint64_t elapsed_us =
-        timestamps[number_of_samples - 1] -
-        timestamps[0];
+        last_sample_time_us -
+        first_sample_time_us;
 
 
     if (elapsed_us == 0)
@@ -731,10 +935,9 @@ static double calculate_measured_sample_rate(
 
 
 // ============================================================
-// Calculate frequency using timestamped positive-going
-// zero crossings.
+// Calculate frequency using positive-going zero crossings.
 //
-// We do NOT assume a sample rate.
+// We do NOT assume the nominal ADC sample rate.
 //
 // First:
 //     Remove DC offset using the average.
@@ -743,27 +946,27 @@ static double calculate_measured_sample_rate(
 //     Look for negative -> positive crossings.
 //
 // Then:
-//     Interpolate both the SIGNAL VALUE and TIME
-//     between the two surrounding samples.
+//     Interpolate the crossing position between the two
+//     surrounding samples.
 //
 // Finally:
-//
-//     frequency =
-//        number of periods
-//        -----------------
-//        actual elapsed time
+//     Convert crossing separation from samples to time using
+//     the measured sample rate for this capture.
 // ============================================================
 
 static bool calculate_frequency(
     const int32_t *samples,
-    const uint64_t *timestamps,
     uint32_t number_of_samples,
+    double measured_sample_rate,
     double *frequency,
     uint32_t *crossing_count,
     double *dc_offset_voltage
 )
 {
-    if (number_of_samples < 3)
+    if (
+        (number_of_samples < 3) ||
+        (measured_sample_rate <= 0.0)
+    )
     {
         return false;
     }
@@ -773,7 +976,8 @@ static bool calculate_frequency(
     // Calculate average ADC value
     // --------------------------------------------------------
 
-    int64_t sum = 0;
+    int64_t sum =
+        0;
 
 
     for (
@@ -792,7 +996,7 @@ static bool calculate_frequency(
         (double)number_of_samples;
 
 
-    // Report measured DC offset in volts
+    // Report measured DC offset in volts.
     *dc_offset_voltage =
         ads_code_to_voltage(
             (int32_t)average
@@ -807,10 +1011,10 @@ static bool calculate_frequency(
         false;
 
 
-    double first_crossing_us =
+    double first_crossing_sample =
         0.0;
 
-    double last_crossing_us =
+    double last_crossing_sample =
         0.0;
 
 
@@ -824,7 +1028,7 @@ static bool calculate_frequency(
         i++
     )
     {
-        // Remove DC component
+        // Remove DC component.
         double previous =
             (double)samples[i - 1] -
             average;
@@ -835,7 +1039,7 @@ static bool calculate_frequency(
             average;
 
 
-        // Positive-going zero crossing
+        // Positive-going zero crossing.
         if (
             (previous < 0.0) &&
             (current >= 0.0)
@@ -848,46 +1052,30 @@ static bool calculate_frequency(
 
             if (difference != 0.0)
             {
-                // --------------------------------------------
-                // Find where between the two voltage samples
-                // the zero crossing occurred.
-                //
-                // fraction = 0 means exactly at sample i-1
-                // fraction = 1 means exactly at sample i
-                // --------------------------------------------
-
+                // Find where between samples i-1 and i
+                // the crossing occurred.
                 double fraction =
                     (-previous) /
                     difference;
 
 
-                // Actual time interval between samples
-                double interval_us =
-                    (double)(
-                        timestamps[i] -
-                        timestamps[i - 1]
-                    );
-
-
-                // Interpolated crossing time
-                double crossing_time_us =
-                    (double)timestamps[i - 1] +
-                    fraction *
-                    interval_us;
+                double crossing_sample =
+                    (double)(i - 1) +
+                    fraction;
 
 
                 if (!found_first)
                 {
-                    first_crossing_us =
-                        crossing_time_us;
+                    first_crossing_sample =
+                        crossing_sample;
 
                     found_first =
                         true;
                 }
 
 
-                last_crossing_us =
-                    crossing_time_us;
+                last_crossing_sample =
+                    crossing_sample;
 
 
                 crossings++;
@@ -916,25 +1104,29 @@ static bool calculate_frequency(
         );
 
 
-    // Actual elapsed time between crossings
-    double elapsed_us =
-        last_crossing_us -
-        first_crossing_us;
+    double elapsed_samples =
+        last_crossing_sample -
+        first_crossing_sample;
 
 
-    if (elapsed_us <= 0.0)
+    if (elapsed_samples <= 0.0)
     {
         return false;
     }
 
 
-    // Convert microseconds to seconds
     double elapsed_seconds =
-        elapsed_us /
-        1000000.0;
+        elapsed_samples /
+        measured_sample_rate;
 
 
-    // Frequency = cycles / time
+    if (elapsed_seconds <= 0.0)
+    {
+        return false;
+    }
+
+
+    // Frequency = cycles / time.
     *frequency =
         periods /
         elapsed_seconds;
@@ -1151,8 +1343,22 @@ int main()
 
 
     printf(
-        "Samples per capture = %d\n\n",
-        NUM_SAMPLES
+        "Maximum capture time = %.1f s\n",
+        (double)MAX_CAPTURE_US /
+        1000000.0
+    );
+
+
+    printf(
+        "Decay stop threshold = %.0f%% of initial signal\n",
+        DECAY_STOP_FRACTION *
+        100.0
+    );
+
+
+    printf(
+        "Maximum stored samples = %d\n\n",
+        MAX_SAMPLES
     );
 
 
@@ -1168,13 +1374,33 @@ int main()
 
 
         // ----------------------------------------------------
-        // Acquire samples and timestamps
+        // Acquire samples
+        //
+        // Capture ends automatically at:
+        //   - 4 seconds, OR
+        //   - 10% of the initial AC signal amplitude.
         // ----------------------------------------------------
+
+        uint32_t samples_captured =
+            0;
+
+        uint64_t first_sample_time_us =
+            0;
+
+        uint64_t last_sample_time_us =
+            0;
+
+        capture_stop_reason_t stop_reason =
+            CAPTURE_STOP_BUFFER_LIMIT;
+
 
         if (!ads_capture_samples(
                 sample_buffer,
-                time_buffer,
-                NUM_SAMPLES))
+                MAX_SAMPLES,
+                &samples_captured,
+                &first_sample_time_us,
+                &last_sample_time_us,
+                &stop_reason))
         {
             printf(
                 "ERROR: DRDY timeout during capture!\n\n"
@@ -1194,19 +1420,21 @@ int main()
 
         double measured_sample_rate =
             calculate_measured_sample_rate(
-                time_buffer,
-                NUM_SAMPLES
+                first_sample_time_us,
+                last_sample_time_us,
+                samples_captured
             );
 
 
         // ----------------------------------------------------
-        // Calculate peak-to-peak amplitude
+        // Calculate peak-to-peak amplitude over the complete
+        // captured record.
         // ----------------------------------------------------
 
         double vpp =
             calculate_vpp(
                 sample_buffer,
-                NUM_SAMPLES
+                samples_captured
             );
 
 
@@ -1229,8 +1457,8 @@ int main()
         bool frequency_valid =
             calculate_frequency(
                 sample_buffer,
-                time_buffer,
-                NUM_SAMPLES,
+                samples_captured,
+                measured_sample_rate,
                 &frequency,
                 &crossings,
                 &dc_offset
@@ -1243,8 +1471,8 @@ int main()
 
         double capture_time_ms =
             (double)(
-                time_buffer[NUM_SAMPLES - 1] -
-                time_buffer[0]
+                last_sample_time_us -
+                first_sample_time_us
             ) /
             1000.0;
 
@@ -1254,8 +1482,8 @@ int main()
         // ----------------------------------------------------
 
         printf(
-            "Captured %d samples\n",
-            NUM_SAMPLES
+            "Captured %lu samples\n",
+            (unsigned long)samples_captured
         );
 
 
@@ -1263,6 +1491,28 @@ int main()
             "Capture time = %.3f ms\n",
             capture_time_ms
         );
+
+
+        if (stop_reason == CAPTURE_STOP_DECAY_LIMIT)
+        {
+            printf(
+                "Capture stopped: signal reached 10%% "
+                "of initial amplitude.\n"
+            );
+        }
+        else if (stop_reason == CAPTURE_STOP_TIME_LIMIT)
+        {
+            printf(
+                "Capture stopped: 4.0 second limit reached.\n"
+            );
+        }
+        else
+        {
+            printf(
+                "Capture stopped: sample buffer full "
+                "(approximately 4 seconds).\n"
+            );
+        }
 
 
         printf(
